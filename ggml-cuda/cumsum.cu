@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdint>
 #include "cumsum.cuh"
 #include "convert.cuh"
 #include "ggml-cuda/common.cuh"
@@ -81,6 +82,14 @@ static __global__ void cumsum_cub_kernel(
 #endif // GGML_CUDA_USE_CUB
 }
 
+// One aligned vector access covers the num_unroll consecutive elements each thread
+// register-blocks over (16 bytes for f32); requires row base pointers aligned to
+// sizeof(cumsum_vec4<T>).
+template<typename T>
+struct alignas(4*sizeof(T)) cumsum_vec4 {
+    T v[4];
+};
+
 // Fallback kernel implementation
 template<typename T>
 static __global__ void cumsum_kernel(
@@ -98,9 +107,8 @@ static __global__ void cumsum_kernel(
     const int warps_per_block = blockDim.x / warp_size;
 
     extern __shared__ float smem[];
-    float *                 s_vals        = smem;
-    float *                 s_warp_sums   = smem + blockDim.x;
-    float *                 s_carry       = smem + blockDim.x + warps_per_block;
+    float *                 s_warp_sums   = smem;
+    float *                 s_carry       = smem + warps_per_block;
     float *                 s_chunk_total = s_carry + 1;
 
     // Initialize carry
@@ -124,27 +132,41 @@ static __global__ void cumsum_kernel(
     constexpr int num_unroll = 4;
     T             temp[num_unroll];
 
+    // a thread's span is num_unroll consecutive elements, so an aligned row base
+    // allows one vector access per span; uniform per row except for the tail span
+    const bool vec_ok = ((uintptr_t) src_row % sizeof(cumsum_vec4<T>) == 0) &&
+                        ((uintptr_t) dst_row % sizeof(cumsum_vec4<T>) == 0);
+
     for (int64_t i = 0; i < ne00; i += num_unroll * blockDim.x) {
         int64_t idx = i + tid * num_unroll;
 
         // thread local sequential scan
-        temp[0] = (idx < ne00 ? src_row[idx] : T(0));
+        if (vec_ok && idx + num_unroll <= ne00) {
+            const cumsum_vec4<T> v = *(const cumsum_vec4<T> *)(src_row + idx);
+            temp[0] = v.v[0];
 #pragma unroll
-        for (int64_t j = 1; j < num_unroll; j++) {
-            temp[j] = temp[j - 1];
-            if (idx + j < ne00) {
-                temp[j] += src_row[idx + j];
-            } else {
-                temp[j] += 0;
+            for (int j = 1; j < num_unroll; j++) {
+                temp[j] = temp[j - 1] + v.v[j];
+            }
+        } else {
+            temp[0] = (idx < ne00 ? src_row[idx] : T(0));
+#pragma unroll
+            for (int64_t j = 1; j < num_unroll; j++) {
+                temp[j] = temp[j - 1];
+                if (idx + j < ne00) {
+                    temp[j] += src_row[idx + j];
+                } else {
+                    temp[j] += 0;
+                }
             }
         }
 
         // last emenent is sum of all values assigned to thread
         float val = (idx < ne00) ? ggml_cuda_cast<float, T>(temp[num_unroll - 1]) : 0.0f;
 
-        // Warp inclusive scan
+        // Warp inclusive scan; val is only ever needed by this thread again, so it
+        // stays live in a register rather than round-tripping through shared memory
         val = warp_prefix_inclusive_sum<T, warp_size>(val);
-        s_vals[tid] = val;
 
         if (lane == warp_size - 1) {
             s_warp_sums[warp] = val;
@@ -167,12 +189,21 @@ static __global__ void cumsum_kernel(
         // write back results
         float carry = *s_carry;
         // calculate sum offset for this thread
-        float final_val_offset = s_vals[tid] + s_warp_sums[warp] + carry - temp[num_unroll - 1];
+        float final_val_offset = val + s_warp_sums[warp] + carry - temp[num_unroll - 1];
 
+        if (vec_ok && idx + num_unroll <= ne00) {
+            cumsum_vec4<T> o;
 #pragma unroll
-        for (int32_t j = 0; j < num_unroll; j++) {
-            if (idx + j < ne00) {
-                dst_row[idx + j] = temp[j] + ggml_cuda_cast<T, float>(final_val_offset);
+            for (int j = 0; j < num_unroll; j++) {
+                o.v[j] = temp[j] + ggml_cuda_cast<T, float>(final_val_offset);
+            }
+            *(cumsum_vec4<T> *)(dst_row + idx) = o;
+        } else {
+#pragma unroll
+            for (int32_t j = 0; j < num_unroll; j++) {
+                if (idx + j < ne00) {
+                    dst_row[idx + j] = temp[j] + ggml_cuda_cast<T, float>(final_val_offset);
+                }
             }
         }
 
@@ -245,7 +276,7 @@ static void cumsum_cuda(
     block_size = std::min(block_size, CUDA_CUMSUM_BLOCK_SIZE);
     dim3 block_dims(block_size, 1, 1);
     const int warps_per_block = block_size / warp_size;
-    const size_t shmem_size = (block_size + warps_per_block + 2) * sizeof(float);
+    const size_t shmem_size = (warps_per_block + 2) * sizeof(float);
 
     if (use_cub && ne00 >= 1024) {
         cumsum_cub_kernel<T, CUDA_CUMSUM_BLOCK_SIZE><<<grid_dims, CUDA_CUMSUM_BLOCK_SIZE, 0, stream>>>(

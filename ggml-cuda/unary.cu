@@ -1,6 +1,8 @@
 #include "unary.cuh"
 #include "convert.cuh"
 
+#include <cstdint>
+
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
 }
@@ -127,8 +129,44 @@ static __global__ void unary_op_kernel(const T * x, T * dst, const int k) {
     dst[i] = (T)op((float)x[i]);
 }
 
+// 4 elements per thread through a single aligned vector access (16 bytes for f32,
+// 8 bytes for f16); requires x and dst aligned to sizeof(unary_vec4<T>).
+// No __restrict__: unary ops may run in place with dst == x.
+template <typename T>
+struct alignas(4*sizeof(T)) unary_vec4 {
+    T v[4];
+};
+
+template <float (*op)(float), typename T>
+static __global__ void unary_op_kernel_v4(const T * x, T * dst, const int k) {
+    ggml_cuda_pdl_lc();
+    const int i0 = 4*(blockDim.x*blockIdx.x + threadIdx.x);
+
+    ggml_cuda_pdl_sync();
+    if (i0 + 4 <= k) {
+        unary_vec4<T> v = *(const unary_vec4<T> *)(x + i0);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v.v[j] = (T)op((float)v.v[j]);
+        }
+        *(unary_vec4<T> *)(dst + i0) = v;
+    } else {
+        // last partial vector: 1-3 scalar elements
+        for (int i = i0; i < k; ++i) {
+            dst[i] = (T)op((float)x[i]);
+        }
+    }
+}
+
 template <float (*op)(float), typename T>
 static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
+    if ((uintptr_t) x % sizeof(unary_vec4<T>) == 0 && (uintptr_t) dst % sizeof(unary_vec4<T>) == 0) {
+        const int nvec = (k + 3) / 4;
+        const int num_blocks = (nvec + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(unary_op_kernel_v4<op, T>, launch_params, x, dst, k);
+        return;
+    }
     const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
@@ -450,7 +488,7 @@ static __global__ void xielu_kernel(const T * x, T * dst, const int k, float alp
 
 template <typename T>
 static void xielu_cuda(const T * x, T * dst, const int k, float alpha_n, float alpha_p, float beta, float eps, cudaStream_t stream) {
-    const int num_blocks = (k + CUDA_XIELU_BLOCK_SIZE) / CUDA_XIELU_BLOCK_SIZE;
+    const int num_blocks = (k + CUDA_XIELU_BLOCK_SIZE - 1) / CUDA_XIELU_BLOCK_SIZE;
     xielu_kernel<<<num_blocks, CUDA_XIELU_BLOCK_SIZE, 0, stream>>>(x, dst, k, alpha_n, alpha_p, beta, eps);
 }
 
@@ -500,7 +538,7 @@ static __global__ void silu_back_kernel(const T * grad, const T * xf, T * dst, c
 
 template <class T>
 static void silu_back_cuda(const T * grad, const T * x, T * dst, const int k, cudaStream_t stream) {
-    const int num_blocks = (k + CUDA_SILU_BACK_BLOCK_SIZE - 1) / CUDA_SILU_BLOCK_SIZE;
+    const int num_blocks = (k + CUDA_SILU_BACK_BLOCK_SIZE - 1) / CUDA_SILU_BACK_BLOCK_SIZE;
     silu_back_kernel<<<num_blocks, CUDA_SILU_BACK_BLOCK_SIZE, 0, stream>>>(grad, x, dst, k);
 }
 

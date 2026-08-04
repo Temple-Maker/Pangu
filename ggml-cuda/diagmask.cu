@@ -15,8 +15,14 @@ static __global__ void diag_mask_inf_f32(const float * x, float * dst, const int
 }
 
 static void diag_mask_inf_f32_cuda(const float * x, float * dst, const int ncols_x, const int nrows_x, const int rows_per_channel, const int n_past, cudaStream_t stream) {
-    const dim3 block_dims(1, CUDA_DIAG_MASK_INF_BLOCK_SIZE, 1);
-    const int block_num_x = (ncols_x + CUDA_DIAG_MASK_INF_BLOCK_SIZE - 1) / CUDA_DIAG_MASK_INF_BLOCK_SIZE;
+    // Pure elementwise kernel: any launch shape gives identical results. The previous
+    // one-warp blocks capped SM residency at the per-SM block-slot limit (16-32 blocks
+    // of 32 threads = 512-1024 resident threads out of a 1536-2048 budget); 256-thread
+    // blocks keep the block-slot limit from binding, capped at the row length rounded
+    // up to a warp so short rows stay lean.
+    const int  block_y     = MIN(CUDA_DIAG_MASK_INF_BLOCK_SIZE, ((ncols_x + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    const dim3 block_dims(1, block_y, 1);
+    const int  block_num_x = (ncols_x + block_y - 1) / block_y;
     const dim3 block_nums(nrows_x, block_num_x, 1);
     diag_mask_inf_f32<<<block_nums, block_dims, 0, stream>>>(x, dst, ncols_x, rows_per_channel, n_past);
 }

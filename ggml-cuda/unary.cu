@@ -314,8 +314,47 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
     dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
 }
 
+// Vector variant: requires n % 4 == 0 (so an aligned 4-span never crosses a row
+// boundary), o0 % 4 == 0 and o1 % 4 == 0 (so every row base stays vector-aligned),
+// and x/g/dst aligned to sizeof(unary_vec4<T>) — all checked at launch.
+template <float (*op)(float), typename T>
+static __global__ void unary_gated_op_kernel_v4(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i0 = 4*(int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
+
+    ggml_cuda_pdl_sync();
+    if (i0 + 4 <= k) {
+        const int64_t j0 = (i0 / n) * o0 + (i0 % n);
+        const int64_t j1 = o0 == o1 ? j0 : (i0 / n) * o1 + (i0 % n);
+
+        unary_vec4<T>       vx = *(const unary_vec4<T> *)(x + j0);
+        const unary_vec4<T> vg = *(const unary_vec4<T> *)(g + j1);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            vx.v[j] = (T)(op((float)vx.v[j]) * (float)vg.v[j]);
+        }
+        *(unary_vec4<T> *)(dst + i0) = vx;
+    } else {
+        // last partial vector: 1-3 scalar elements
+        for (int64_t i = i0; i < k; ++i) {
+            const int64_t j0 = (i / n) * o0 + (i % n);
+            const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+            dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+        }
+    }
+}
+
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+    if (n % 4 == 0 && o0 % 4 == 0 && o1 % 4 == 0 &&
+        (uintptr_t) x % sizeof(unary_vec4<T>) == 0 && (uintptr_t) g % sizeof(unary_vec4<T>) == 0 &&
+        (uintptr_t) dst % sizeof(unary_vec4<T>) == 0) {
+        const int64_t nvec = (k + 3) / 4;
+        const int64_t num_blocks = (nvec + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(unary_gated_op_kernel_v4<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+        return;
+    }
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
@@ -415,8 +454,42 @@ static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, cons
     dst[i] = ggml_cuda_op_swiglu_oai_single(xi, gi, alpha, limit);
 }
 
+// Vector variant; same row-span and alignment preconditions as unary_gated_op_kernel_v4.
+template <typename T>
+static __global__ void swiglu_oai_kernel_v4(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float alpha, float limit) {
+    const int64_t i0 = 4*(int64_t(blockDim.x)*blockIdx.x + threadIdx.x);
+
+    if (i0 + 4 <= k) {
+        const int64_t j0 = (i0 / n) * o0 + (i0 % n);
+        const int64_t j1 = o0 == o1 ? j0 : (i0 / n) * o1 + (i0 % n);
+
+        unary_vec4<T>       vx = *(const unary_vec4<T> *)(x + j0);
+        const unary_vec4<T> vg = *(const unary_vec4<T> *)(g + j1);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            vx.v[j] = ggml_cuda_op_swiglu_oai_single((float)vx.v[j], (float)vg.v[j], alpha, limit);
+        }
+        *(unary_vec4<T> *)(dst + i0) = vx;
+    } else {
+        // last partial vector: 1-3 scalar elements
+        for (int64_t i = i0; i < k; ++i) {
+            const int64_t j0 = (i / n) * o0 + (i % n);
+            const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+            dst[i] = ggml_cuda_op_swiglu_oai_single((float)x[j0], (float)g[j1], alpha, limit);
+        }
+    }
+}
+
 template <typename T>
 static void swiglu_oai_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float alpha, const float limit, cudaStream_t stream) {
+    if (n % 4 == 0 && o0 % 4 == 0 && o1 % 4 == 0 &&
+        (uintptr_t) x % sizeof(unary_vec4<T>) == 0 && (uintptr_t) g % sizeof(unary_vec4<T>) == 0 &&
+        (uintptr_t) dst % sizeof(unary_vec4<T>) == 0) {
+        const int64_t nvec = (k + 3) / 4;
+        const int64_t num_blocks = (nvec + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+        swiglu_oai_kernel_v4<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1, alpha, limit);
+        return;
+    }
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1, alpha, limit);
 }

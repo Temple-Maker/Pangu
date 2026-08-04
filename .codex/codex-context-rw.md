@@ -8,5 +8,9 @@ This document will serve as a manual place where I'm going to input all of my co
 
 - This is going to be the first set of open-source kernels that I pull in. This is from the official ``llama.cpp`` repository, where I'm going to try and optimize them in any way possible. I'm going to learn what it means to optimize on three specific architectures: Blackwell RTX 6000, A100, and H100/200s. (Note: I bunched together H100 and H200 since they have functionally the same architecture.) Additionally, I'm going to see if I can use the FASRC cluster to test other GPU architectures such as AMD or Intel or Metal/Vulkan or other variations of NVIDIA GPUs.
 
+### ``lamma.cpp/ggml`` Kernel List -- First Sweep
+
+- Completed ``softmax.cu`` and ``scale.cu``. 
+
 
 

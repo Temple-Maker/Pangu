@@ -1,2 +1,4 @@
-# Codex Context
+# Codex-Context-RW
+
+This document will serve as a manual place where I'm going to input all of my commands and findings in the future. This will not be the prompts that I input, rather just the information or learnings that I want to add in-case I ever come back to the project at a different time. It's both for the sake of context-management, prompt-sharing, and also general learnings that would be useful to refine my prompting. Also, moving forward, I'm going to be deprecating the Project Construction and Company Preparation documents. These will be migrated over to 
 

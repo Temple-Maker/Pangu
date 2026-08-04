@@ -84,6 +84,63 @@ static __global__ void soft_max_f32(
 
     float max_val = sinks ? sinks[i02] : -INFINITY;
 
+    if constexpr (!use_shared) {
+        // The row does not fit in shared memory, so vals aliases dst and every loop below is
+        // a full sweep over global memory. Fold the max and sum passes into a single online
+        // softmax pass (Milakov & Gimelshein, 2018): each thread keeps a running (max, sum)
+        // pair and rescales the sum whenever its max grows. This saves one full read+write
+        // sweep over the row at the cost of one extra expf per element in the normalization
+        // pass; at these row lengths the kernel is bound by memory bandwidth, not MUFU.
+        float sum = 0.0f;
+
+        for (int col0 = 0; col0 < ncols; col0 += block_size) {
+            const int col = col0 + tid;
+
+            if (col >= ncols) {
+                break;
+            }
+
+            const float val = x[col]*p.scale + (mask ? slope*t2f32(mask[col]) : 0.0f);
+            vals[col] = val;
+
+            if (val > max_val) {
+                sum = sum*expf(max_val - val) + 1.0f; // safe for max_val == -INFINITY: expf(-INFINITY) == 0
+                max_val = val;
+            } else if (val != -INFINITY) {
+                // val == -INFINITY is skipped: it contributes 0 and expf of (-INFINITY - -INFINITY) is NaN
+                sum += expf(val - max_val);
+            }
+        }
+
+        const float max_val_block = block_reduce<block_reduce_method::MAX, block_size_template>(max_val, buf_iw);
+
+        // rescale the per-thread partial sum to be relative to the block-wide max
+        sum *= expf(max_val - max_val_block);
+
+        if (block_size > WARP_SIZE) {
+            // sync is needed as we reuse buf_iw across block_reduce invocations, see #26385
+            __syncthreads();
+        }
+        float tmp = block_reduce<block_reduce_method::SUM, block_size_template>(sum, buf_iw);
+
+        if (sinks) {
+            tmp += expf(sinks[i02] - max_val_block);
+        }
+
+        const float inv_sum = 1.0f / tmp;
+
+        for (int col0 = 0; col0 < ncols; col0 += block_size) {
+            const int col = col0 + tid;
+
+            if (col >= ncols) {
+                return;
+            }
+
+            dst[col] = expf(vals[col] - max_val_block) * inv_sum;
+        }
+        return;
+    }
+
 #pragma unroll
     for (int col0 = 0; col0 < ncols; col0 += block_size) {
         const int col = col0 + tid;

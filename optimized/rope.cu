@@ -356,8 +356,15 @@ static void rope_norm_cuda(const T *            x,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    // One thread per rotation pair: only ne00/2 threads per row ever do work, so size
+    // the block to the row's pair count (rounded up to a warp) instead of a fixed
+    // CUDA_ROPE_BLOCK_SIZE. A block's thread/register allocation is reserved for its
+    // whole lifetime, so at head_dim 128 the fixed 256-thread block kept 75% of its
+    // lanes idle-but-resident; a right-sized block packs 2-4x more active warps per SM.
+    const int  n_pairs    = ne00 / 2;
+    const int  block_y    = MIN(CUDA_ROPE_BLOCK_SIZE, ((n_pairs + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    const dim3 block_dims(1, block_y, 1);
+    const int  n_blocks_x = (ne00 + 2 * block_y - 1) / (2 * block_y);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
@@ -398,8 +405,15 @@ static void rope_neox_cuda(const T *            x,
                            const int            set_rows_stride,
                            cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    // One thread per rotation pair: only ne00/2 threads per row ever do work, so size
+    // the block to the row's pair count (rounded up to a warp) instead of a fixed
+    // CUDA_ROPE_BLOCK_SIZE. A block's thread/register allocation is reserved for its
+    // whole lifetime, so at head_dim 128 the fixed 256-thread block kept 75% of its
+    // lanes idle-but-resident; a right-sized block packs 2-4x more active warps per SM.
+    const int  n_pairs    = ne00 / 2;
+    const int  block_y    = MIN(CUDA_ROPE_BLOCK_SIZE, ((n_pairs + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    const dim3 block_dims(1, block_y, 1);
+    const int  n_blocks_x = (ne00 + 2 * block_y - 1) / (2 * block_y);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
@@ -441,8 +455,15 @@ static void rope_multi_cuda(const T *            x,
                             const bool           is_imrope,
                             cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    // One thread per rotation pair: only ne00/2 threads per row ever do work, so size
+    // the block to the row's pair count (rounded up to a warp) instead of a fixed
+    // CUDA_ROPE_BLOCK_SIZE. A block's thread/register allocation is reserved for its
+    // whole lifetime, so at head_dim 128 the fixed 256-thread block kept 75% of its
+    // lanes idle-but-resident; a right-sized block packs 2-4x more active warps per SM.
+    const int  n_pairs    = ne00 / 2;
+    const int  block_y    = MIN(CUDA_ROPE_BLOCK_SIZE, ((n_pairs + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    const dim3 block_dims(1, block_y, 1);
+    const int  n_blocks_x = (ne00 + 2 * block_y - 1) / (2 * block_y);
     const dim3 block_nums(nr, n_blocks_x, 1);
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
@@ -484,8 +505,15 @@ static void rope_vision_cuda(const T *            x,
                              const mrope_sections sections,
                              cudaStream_t         stream) {
     GGML_ASSERT(ne00 % 2 == 0);
-    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
-    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
+    // One thread per rotation pair: only ne00/2 threads per row ever do work, so size
+    // the block to the row's pair count (rounded up to a warp) instead of a fixed
+    // CUDA_ROPE_BLOCK_SIZE. A block's thread/register allocation is reserved for its
+    // whole lifetime, so at head_dim 128 the fixed 256-thread block kept 75% of its
+    // lanes idle-but-resident; a right-sized block packs 2-4x more active warps per SM.
+    const int  n_pairs    = ne00 / 2;
+    const int  block_y    = MIN(CUDA_ROPE_BLOCK_SIZE, ((n_pairs + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE);
+    const dim3 block_dims(1, block_y, 1);
+    const int  n_blocks_x = (ne00 + 2 * block_y - 1) / (2 * block_y);
     const dim3 block_nums(nr, n_blocks_x, 1);
     // break down (head_dim, heads, seq) into (CUDA_ROPE_BLOCK_SIZE, x, heads * seq)
     // where x ~= ceil(head_dim / CUDA_ROPE_BLOCK_SIZE);

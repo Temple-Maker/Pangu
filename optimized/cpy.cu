@@ -1,6 +1,9 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+
+#include <cstdint>
+#include <limits>
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -176,6 +179,95 @@ static __global__ void cpy_q_f32(const char * cx, char * cdst, const int64_t ne,
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
+// Cooperative dequantizing copy: one thread per dequantized float2 pair (qk/2 threads
+// per quant block) instead of one thread serially expanding a whole quant block. With
+// the serial mapping each thread owns qk consecutive floats, so adjacent lanes store
+// 4*qk bytes apart and every store instruction scatters across 32 cache lines; with
+// the pair mapping adjacent lanes write adjacent floats and stores coalesce. The
+// offset decomposition runs per pair instead of per quant block, so it uses 32-bit
+// fastdiv (per-thread int64 division would dominate at this thread count); the
+// launcher falls back to the serial kernel when ne exceeds 32-bit indexing.
+// pairs_interleaved: q8_0-style dequant yields elements (2j, 2j+1); otherwise (j, j+qk/2).
+template <dequantize_kernel_t dequant, int qk, bool pairs_interleaved>
+static __global__ void cpy_q_f32_coop(const char * cx, char * cdst, const uint32_t ne,
+                                      const uint3 ne00_fdv, const uint3 ne01_fdv, const uint3 ne02_fdv,
+                                      const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+                                      const uint3 ne10_fdv, const uint3 ne11_fdv, const uint3 ne12_fdv,
+                                      const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
+    constexpr uint32_t pairs_per_qb = qk/2;
+    const uint32_t tid = blockDim.x*blockIdx.x + threadIdx.x;
+    const uint32_t j   = tid % pairs_per_qb;        // pair index within the quant block (qk is a power of two -> shifts)
+    const uint32_t i   = (tid / pairs_per_qb) * qk; // first element index of this thread's quant block
+
+    if (i >= ne) {
+        return;
+    }
+
+    uint2 dm = fast_div_modulo(i, ne00_fdv);
+    const uint32_t i00 = dm.y;
+    dm = fast_div_modulo(dm.x, ne01_fdv);
+    const uint32_t i01 = dm.y;
+    dm = fast_div_modulo(dm.x, ne02_fdv);
+    const uint32_t i02 = dm.y;
+    const uint32_t i03 = dm.x;
+    const int64_t x_offset = (i00/qk)*nb00 + (int64_t)i01*nb01 + (int64_t)i02*nb02 + (int64_t)i03*nb03;
+
+    dm = fast_div_modulo(i, ne10_fdv);
+    const uint32_t i10 = dm.y;
+    dm = fast_div_modulo(dm.x, ne11_fdv);
+    const uint32_t i11 = dm.y;
+    dm = fast_div_modulo(dm.x, ne12_fdv);
+    const uint32_t i12 = dm.y;
+    const uint32_t i13 = dm.x;
+    const int64_t dst_offset = (int64_t)i10*nb10 + (int64_t)i11*nb11 + (int64_t)i12*nb12 + (int64_t)i13*nb13;
+
+    ggml_cuda_pdl_sync();
+    const char * cxi   = cx + x_offset;
+    float      * cdstf = (float *)(cdst + dst_offset);
+
+    float2 dq;
+    if constexpr (pairs_interleaved) {
+        dequant(cxi, 0, 2*j, dq);
+        cdstf[2*j + 0] = dq.x;
+        cdstf[2*j + 1] = dq.y;
+    } else {
+        dequant(cxi, 0, j, dq);
+        cdstf[j]        = dq.x;
+        cdstf[j + qk/2] = dq.y;
+    }
+}
+
+// Dispatch for the q->f32 copies: cooperative pair-mapped kernel when the element
+// count fits 32-bit indexing (virtually always), serial quant-block-per-thread
+// kernel otherwise. Both compute the identical dequantized value per element.
+template <cpy_kernel_t cpy_blck, dequantize_kernel_t dequant, int qk, bool pairs_interleaved>
+static void ggml_cpy_q_f32_cuda(
+    const char * cx, char * cdst, const int64_t ne,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+    const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11,
+    const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
+
+    if (ne <= (int64_t) std::numeric_limits<uint32_t>::max()) {
+        const int64_t npairs     = ne / 2; // one thread per dequantized float2 pair
+        const int64_t num_blocks = (npairs + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+        GGML_ASSERT(num_blocks <= INT_MAX);
+        cpy_q_f32_coop<dequant, qk, pairs_interleaved><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
+            cx, cdst, (uint32_t) ne,
+            init_fastdiv_values(ne00), init_fastdiv_values(ne01), init_fastdiv_values(ne02),
+            nb00, nb01, nb02, nb03,
+            init_fastdiv_values(ne10), init_fastdiv_values(ne11), init_fastdiv_values(ne12),
+            nb10, nb11, nb12, nb13);
+        return;
+    }
+
+    // >4G-element tensors: 32-bit fastdiv indexing does not apply; one quant block per thread
+    const int64_t nqblocks   = (ne + qk - 1) / qk;
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+    cpy_q_f32<cpy_blck, qk><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>(
+        cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
 template<typename src_t, typename dst_t>
 static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const int64_t ne) {
     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
@@ -253,9 +345,14 @@ static void ggml_cpy_f32_q8_0_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK8_0 == 0);
-    const int64_t num_blocks = ne / QK8_0;
+    // One quant block per thread, in full thread blocks instead of the previous
+    // one-thread-per-CUDA-block launch: the kernels index by global thread id
+    // ((blockDim.x*blockIdx.x + threadIdx.x)*qk), so the work assignment — and
+    // therefore the output — is identical; only SM residency changes.
+    const int64_t nqblocks = ne / QK8_0;
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, 1, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -264,10 +361,8 @@ static void ggml_cpy_q8_0_f32_cuda(
     const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_q_f32<cpy_blck_q8_0_f32, QK8_0><<<num_blocks, 1, 0, stream>>>
-        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+    ggml_cpy_q_f32_cuda<cpy_blck_q8_0_f32, dequantize_q8_0, QK8_0, /*pairs_interleaved=*/true>
+        (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13, stream);
 }
 
 static void ggml_cpy_f32_q4_0_cuda(
@@ -276,9 +371,10 @@ static void ggml_cpy_f32_q4_0_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK4_0 == 0);
-    const int64_t num_blocks = ne / QK4_0;
+    const int64_t nqblocks = ne / QK4_0; // one quant block per thread
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q4_0, QK4_0><<<num_blocks, 1, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q4_0, QK4_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -289,11 +385,9 @@ static void ggml_cpy_q4_0_f32_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
     const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
     cudaStream_t stream) {
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_0, QK4_0>, QK4_0><<<num_blocks, 1, 0, stream>>>(
+    ggml_cpy_q_f32_cuda<cpy_blck_q_f32<dequantize_q4_0, QK4_0>, dequantize_q4_0, QK4_0, /*pairs_interleaved=*/false>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
-         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+         ne10, ne11, ne12, nb10, nb11, nb12, nb13, stream);
 }
 
 static void ggml_cpy_f32_q4_1_cuda(
@@ -302,9 +396,10 @@ static void ggml_cpy_f32_q4_1_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK4_1 == 0);
-    const int64_t num_blocks = ne / QK4_1;
+    const int64_t nqblocks = ne / QK4_1; // one quant block per thread
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q4_1, QK4_1><<<num_blocks, 1, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q4_1, QK4_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -315,11 +410,9 @@ static void ggml_cpy_q4_1_f32_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
     const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
     cudaStream_t stream) {
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q4_1, QK4_1>, QK4_1><<<num_blocks, 1, 0, stream>>>(
+    ggml_cpy_q_f32_cuda<cpy_blck_q_f32<dequantize_q4_1, QK4_1>, dequantize_q4_1, QK4_1, /*pairs_interleaved=*/false>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
-         ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+         ne10, ne11, ne12, nb10, nb11, nb12, nb13, stream);
 }
 
 static void ggml_cpy_f32_q5_0_cuda(
@@ -328,9 +421,10 @@ static void ggml_cpy_f32_q5_0_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK5_0 == 0);
-    const int64_t num_blocks = ne / QK5_0;
+    const int64_t nqblocks = ne / QK5_0; // one quant block per thread
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q5_0, QK5_0><<<num_blocks, 1, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q5_0, QK5_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -341,11 +435,9 @@ static void ggml_cpy_q5_0_f32_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
     const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
     cudaStream_t stream) {
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q5_0, QK5_0>, QK5_0><<<num_blocks, 1, 0, stream>>>(
+    ggml_cpy_q_f32_cuda<cpy_blck_q_f32<dequantize_q5_0, QK5_0>, dequantize_q5_0, QK5_0, /*pairs_interleaved=*/false>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
-        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        ne10, ne11, ne12, nb10, nb11, nb12, nb13, stream);
 }
 
 static void ggml_cpy_f32_q5_1_cuda(
@@ -354,9 +446,10 @@ static void ggml_cpy_f32_q5_1_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK5_1 == 0);
-    const int64_t num_blocks = ne / QK5_1;
+    const int64_t nqblocks = ne / QK5_1; // one quant block per thread
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_q5_1, QK5_1><<<num_blocks, 1, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_q5_1, QK5_1><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
@@ -367,11 +460,9 @@ static void ggml_cpy_q5_1_f32_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12,
     const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13,
     cudaStream_t stream) {
-    const int64_t num_blocks = ne;
-    GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_q_f32<cpy_blck_q_f32<dequantize_q5_1, QK5_1>, QK5_1><<<num_blocks, 1, 0, stream>>>(
+    ggml_cpy_q_f32_cuda<cpy_blck_q_f32<dequantize_q5_1, QK5_1>, dequantize_q5_1, QK5_1, /*pairs_interleaved=*/false>(
         cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03,
-        ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+        ne10, ne11, ne12, nb10, nb11, nb12, nb13, stream);
 }
 
 static void ggml_cpy_f32_iq4_nl_cuda(
@@ -380,9 +471,10 @@ static void ggml_cpy_f32_iq4_nl_cuda(
     const int64_t nb03, const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13, cudaStream_t stream) {
 
     GGML_ASSERT(ne % QK4_NL == 0);
-    const int64_t num_blocks = ne / QK4_NL;
+    const int64_t nqblocks = ne / QK4_NL; // one quant block per thread
+    const int64_t num_blocks = (nqblocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
     GGML_ASSERT(num_blocks <= INT_MAX);
-    cpy_f32_q<cpy_blck_f32_iq4_nl, QK4_NL><<<num_blocks, 1, 0, stream>>>
+    cpy_f32_q<cpy_blck_f32_iq4_nl, QK4_NL><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 

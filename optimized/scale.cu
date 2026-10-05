@@ -1,5 +1,7 @@
 #include "scale.cuh"
 
+#include <cstdint>
+
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
 static __global__ void scale_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
@@ -13,7 +15,39 @@ static __global__ void scale_f32(const float * x, float * dst, const float scale
     }
 }
 
+// 4 elements per thread via 16-byte accesses; requires x and dst to be 16-byte aligned.
+// No __restrict__: ggml_scale_inplace runs this kernel with dst == x.
+static __global__ void scale_f32_v4(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
+    ggml_cuda_pdl_lc();
+    const int64_t tid    = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    const int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
+    const int64_t nvec   = nelements / 4;
+
+    const float4 * x4   = (const float4 *) x;
+    float4       * dst4 = (float4       *) dst;
+
+    ggml_cuda_pdl_sync();
+    for (int64_t i = tid; i < nvec; i += stride) {
+        float4 v = x4[i];
+        v.x = scale * v.x + bias;
+        v.y = scale * v.y + bias;
+        v.z = scale * v.z + bias;
+        v.w = scale * v.w + bias;
+        dst4[i] = v;
+    }
+    for (int64_t i = 4*nvec + tid; i < nelements; i += stride) {
+        dst[i] = scale * x[i] + bias;
+    }
+}
+
 static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
+    if ((uintptr_t) x % 16 == 0 && (uintptr_t) dst % 16 == 0) {
+        const int64_t nvec = (nelements + 3) / 4;
+        const int64_t num_blocks = (nvec + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
+        ggml_cuda_kernel_launch(scale_f32_v4, launch_params, x, dst, scale, bias, nelements);
+        return;
+    }
     const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
     ggml_cuda_kernel_launch(scale_f32, launch_params, x, dst, scale, bias, nelements);

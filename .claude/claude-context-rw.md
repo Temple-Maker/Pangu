@@ -12,66 +12,75 @@ This document will serve as a manual place where I'm going to input all of my co
 
 - Completed ``softmax.cu`` and ``scale.cu``. 
 
+### Status and workflow (updated 2026-10-04)
+
+- **Validation status — read this before concluding anything is unvalidated.** Every optimized kernel has been run on FASRC (full A100-SXM4-40GB): correctness 12994/12994 for PRs #2-#17, A/B perf rounds 1-2, and round 3 for PR #18. Details are in the "Hardware validation" and "A/B" sections below; the cluster-side record is ``~/llama.cpp/HANDOFF.md``. Real remaining gaps: (a) ``sum.cu`` non-CUB fallback (needs a HIP/AMD build), (b) H100/H200 and Blackwell (binaries are sm_80 only), (c) perf numbers for ops the harness has no perf cases for (SWIGLU/REGLU/GEGLU/SCALE/CLAMP/GET_ROWS/DIAG_MASK_INF/FILL/ARANGE, q8_0 CPY).
+- **Repo layout (PR #19):** ``ggml-cuda/`` is the pristine vendored baseline (llama.cpp @ ``2f56fc3``, never edited). Optimized kernels live in ``optimized/`` under the same filenames, as a drop-in overlay. File names in the log entries below refer to the copy in ``optimized/``.
+- **Rules for every kernel:** (1) new branch ``perf/<kernel>-<what>`` from main; (2) every commit carries the ``Co-Authored-By: Claude ... <noreply@anthropic.com>`` trailer and lands through a merged PR (Pair Extraordinaire); (3) edit only the ``optimized/`` copy — copy the file over from ``ggml-cuda/`` first if it is not there yet; (4) write the perf prediction in the PR before measuring; validate on FASRC with repeats/stddev before merge.
+- **Grab a GPU:** ``ssh cannon`` then ``salloc -p kempner --account=kempner_undergrads --gres=gpu:1 -c 4 --mem=32G -t 0-02:00``, then ``module purge && module load cmake gcc/14.2.0-fasrc01 cuda/12.9.1-fasrc01``. Keep ``-c`` under 8 per GPU; never benchmark on ``gpu_test`` (MIG only). H100: ``-p kempner_h100_priority``, after rebuilding with ``-DCMAKE_CUDA_ARCHITECTURES="80;90"``.
+- **Build from the overlay:** ``cp -r Pangu/ggml-cuda/. llama.cpp/ggml/src/ggml-cuda/`` then ``cp -r Pangu/optimized/. llama.cpp/ggml/src/ggml-cuda/`` (skip the second copy for the baseline build).
+- **Backlog:** PR #18 follow-up tuning (694 GB/s vs ~1.3 TB/s roofline); f32->q cooperative quantize (warp amax); rope ``powf`` -> ``exp2f``; ``k_get_rows_back_float`` redesign; then mmq / mmvq / fattn, the only place end-to-end throughput can move.
+
 ### Kernel Optimization Log (maintained by Claude Code)
 
 One entry per finished kernel: what changed, why it should be faster, and what still needs hardware validation. Baseline for all entries: llama.cpp upstream commit ``2f56fc3`` (2026-08-04).
 
-- ``softmax.cu`` — branch ``perf/softmax-online-fallback``, PR #2 (open).
+- ``softmax.cu`` — branch ``perf/softmax-online-fallback``, PR #2 (merged).
   - Change: online softmax (Milakov & Gimelshein 2018) for the ``use_shared=false`` fallback path only — rows too long for shared memory, where scratch lives in ``dst`` in global memory. Each thread keeps a running (max, sum) pair and rescales the sum when its max grows, fusing the max pass and the exp+sum pass.
   - Why faster: global traffic drops from 3 reads + 3 writes to 2 reads + 2 writes per element (~33%) on a bandwidth-bound path. Cost: one extra ``expf`` per element (MUFU is not the limiter at these row lengths). Masked ``-inf`` elements skip ``expf`` entirely.
-  - Scope/risk: shared-memory hot path byte-for-byte unchanged (``if constexpr`` discard). Sinks, NaN propagation, fully-masked-row NaN, and the #26385 ``__syncthreads`` guard all match upstream. Unvalidated on hardware: run ``test-backend-ops -o SOFT_MAX`` (correctness) and ``perf`` mode. Fallback triggers when ``(ncols padded to 32) + 32`` floats exceed smpbo (~25K cols on consumer, ~40-56K on A100/H100).
+  - Scope/risk: shared-memory hot path byte-for-byte unchanged (``if constexpr`` discard). Sinks, NaN propagation, fully-masked-row NaN, and the #26385 ``__syncthreads`` guard all match upstream. Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o SOFT_MAX`` (correctness) and ``perf`` mode. Fallback triggers when ``(ncols padded to 32) + 32`` floats exceed smpbo (~25K cols on consumer, ~40-56K on A100/H100).
 
-- ``scale.cu`` — branch ``perf/scale-float4``, PR #3 (open).
+- ``scale.cu`` — branch ``perf/scale-float4``, PR #3 (merged).
   - Change: added ``scale_f32_v4`` processing 4 elements/thread via ``float4`` (16-byte accesses) with an in-kernel scalar tail loop; host dispatches on a 16-byte alignment check of both pointers, otherwise falls back to the unchanged scalar kernel.
   - Why faster: pure streaming kernel; 4x fewer memory instructions per byte and wider transactions improve achieved bandwidth, mainly at low occupancy / small-to-mid tensors. Bitwise-identical results (same FFMA per element).
-  - Scope/risk: no ``__restrict__`` on purpose (``ggml_scale_inplace`` runs with ``dst == x``). PDL lc/sync structure preserved. Unvalidated: ``test-backend-ops -o SCALE``.
+  - Scope/risk: no ``__restrict__`` on purpose (``ggml_scale_inplace`` runs with ``dst == x``). PDL lc/sync structure preserved. Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o SCALE``.
 
-- ``clamp.cu`` — branch ``perf/clamp-vec4``, PR #4 (open).
+- ``clamp.cu`` — branch ``perf/clamp-vec4``, PR #4 (merged).
   - Change: added ``op_clamp_kernel_v4`` processing 4 elements/thread through an ``alignas(4*sizeof(T))`` wrapper struct — one 16-byte access for f32, one 8-byte access for f16 — with a scalar tail for ``k % 4``. Host dispatches on pointer alignment; scalar kernel unchanged as fallback.
   - Why faster: 4x fewer memory instructions for both dtypes; f16 especially benefits since 2-byte scalar accesses are the least efficient width. Bitwise-identical results (same per-element float-convert + fminf/fmaxf).
-  - Scope/risk: no ``__restrict__`` (in-place clamp). ``k`` stays ``int`` (upstream contract). Unvalidated: ``test-backend-ops -o CLAMP``.
+  - Scope/risk: no ``__restrict__`` (in-place clamp). ``k`` stays ``int`` (upstream contract). Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o CLAMP``.
   - Workflow note: the first attempt at this commit swept in staged context-doc edits (docs were git-added before the commit); fixed with ``git reset --soft`` + recommit + force-push. Lesson: check ``git status`` for staged files before committing on perf branches.
 
-- ``cumsum.cu`` — branch ``perf/cumsum-fallback-vec4``, PR #5 (open).
+- ``cumsum.cu`` — branch ``perf/cumsum-fallback-vec4``, PR #5 (merged).
   - Change: two edits to ``cumsum_kernel`` (the non-CUB fallback scan; CUB paths untouched). (1) Removed the ``s_vals`` shared array — each thread only ever read back its own slot, so the warp-scanned value now stays in a register; smem per block drops ~1 KiB and a store+load per tile disappears. (2) Vectorized the 4-consecutive-element register-blocking loads/stores with the same ``alignas`` struct idiom as clamp (16B for f32), guarded per row on alignment with the scalar path kept for tails/unaligned rows.
   - Why faster: less shared-memory traffic and capacity per block, 4x fewer memory instructions on the main path. Sequential-add order unchanged → bitwise-identical results.
-  - Scope/risk: launch-side ``shmem_size`` updated in lockstep with the kernel's smem layout (they must move together). Verified ``warp_prefix_inclusive_sum`` is pure shuffle before removing the array. Unvalidated: ``test-backend-ops -o CUMSUM``.
+  - Scope/risk: launch-side ``shmem_size`` updated in lockstep with the kernel's smem layout (they must move together). Verified ``warp_prefix_inclusive_sum`` is pure shuffle before removing the array. Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o CUMSUM``.
   - Reading note: the ``s_vals`` find is a good pattern to hunt for — shared memory that is written and read only by the same thread is always a register in disguise.
 
-- ``sum.cu`` — branch ``perf/sum-fallback-reduction``, PR #6 (open).
+- ``sum.cu`` — branch ``perf/sum-fallback-reduction``, PR #6 (merged).
   - Change: replaced the non-CUB fallback (HIP/MUSA builds only; CUB path untouched) that summed the whole tensor via ``sum_rows`` with ``nrows == 1`` — i.e. ONE thread block for the entire reduction — with a two-pass tree reduction: up to 1024 grid-striding blocks write partial sums (pool buffer), then one block reduces the partials. Tensors <= 256 elements take a direct single-block path.
   - Why faster: ~1000x parallelism deficit removed for large tensors on AMD builds. Deterministic by construction (fixed grid geometry), which is why it is two passes and not a one-pass ``atomicAdd``.
   - Scope/risk: results differ from the old fallback in rounding only (different association order). Only compiles/runs on non-CUB builds — needs a HIP build to validate (``test-backend-ops -o SUM``); relevant to the planned FASRC AMD experiments.
 
-- ``rope.cu`` — branch ``perf/rope-launch-geometry``, PR #7 (open). Round 2 begins.
+- ``rope.cu`` — branch ``perf/rope-launch-geometry``, PR #7 (merged). Round 2 begins.
   - Change: host-only launch-geometry fix across all four RoPE launchers (norm/neox/multi/vision). Blocks were a fixed (1, 256) with one thread per rotation pair, but a row has only ``ne00/2`` pairs — at head_dim 128, 75% of every block's lanes failed the bounds check instantly yet stayed resident (a block's thread/register allocation is held for its lifetime). Now ``blockDim.y`` = pair count rounded up to a warp, capped at 256; kernels untouched (they read ``blockDim.y`` dynamically).
   - Why faster: 2-4x more *active* warps per SM on a memory-bound kernel — active warps are what hide DRAM latency. RoPE runs on every layer's Q and K even with flash attention on, so this is the first change on the genuinely hot inference path.
-  - Scope/risk: bitwise identical (only never-active threads removed; >256-pair rows reproduce old geometry exactly). Unvalidated: ``test-backend-ops -o ROPE``, ``llama-bench -p 2048``.
+  - Scope/risk: bitwise identical (only never-active threads removed; >256-pair rows reproduce old geometry exactly). Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o ROPE``, ``llama-bench -p 2048``.
   - Future work noted in PR: ``powf(theta_scale, i0/2)`` → ``exp2f`` with host-precomputed log2 (changes rounding; needs its own hardware-validated PR).
   - Reading note: third optimization genre so far — (1) algorithmic (softmax online rescale), (2) access width (float4/alignas), (3) launch geometry (thread blocks sized to actual work). Occupancy claimed by dead lanes is invisible in the code; you find it by comparing the bounds check against the block shape.
 
-- ``mean.cu`` → actually ``reduce_rows.cuh`` — branch ``perf/reduce-rows-vec4``, PR #8 (open).
+- ``mean.cu`` → actually ``reduce_rows.cuh`` — branch ``perf/reduce-rows-vec4``, PR #8 (merged).
   - Change: ``mean.cu`` itself is dispatch + upstream-tuned heuristics (PR #15132), so the real target was the shared ``reduce_rows_f32`` kernel serving both MEAN and SUM_ROWS. Vectorized its load loop: 4 columns per ``float4`` load when ``ncols % 4 == 0`` and base is 16B-aligned (two loads/iteration preserves the 8-deep unroll); scalar loop kept verbatim as fallback.
   - Why faster: 4x fewer load instructions; biggest effect in the low-nrows 512-thread regime where the kernel is latency-bound. ``ncols % 4 == 0`` guarantees every row base stays aligned, so the check is once per kernel.
-  - Scope/risk: NOT bitwise-identical on the vec path (accumulator lanes regroup → rounding differs; same reassociation reasoning as PR #6). Unvalidated: ``test-backend-ops -o MEAN`` and ``-o SUM_ROWS``.
+  - Scope/risk: NOT bitwise-identical on the vec path (accumulator lanes regroup → rounding differs; same reassociation reasoning as PR #6). Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o MEAN`` and ``-o SUM_ROWS``.
   - Reading note: when a kernel file turns out to be a dispatch shell, follow the include to where the loads actually happen — the "one file = one kernel" mapping is a convention, not a law.
 
-- ``sumrows.cu`` — branch ``perf/sumrows-dedupe-blocksize``, PR #9 (open).
+- ``sumrows.cu`` — branch ``perf/sumrows-dedupe-blocksize``, PR #9 (merged).
   - Change: (1) capped the low-nrows branch's 512-thread blocks at ``ncols`` rounded up to a warp — for short rows, hundreds of threads were skipping the load loop and feeding zeros into ``block_reduce``, paying sync cost for nothing; rows >= 512 columns keep the old geometry exactly. (2) Deduplicated: ``ggml_cuda_op_sum_rows`` re-implemented ``sum_rows_f32_cuda`` line for line; it now calls the helper, keeping the PR #15132 heuristic in one place. Net -9 lines.
   - Why faster: fewer reduction participants and scheduler slots for small-row shapes. Bitwise identical up to the sign of zero (removed threads contributed exact 0.0f).
-  - Scope/risk: kernel untouched (that was PR #8); public signature unchanged; no other callers. Unvalidated: ``test-backend-ops -o SUM_ROWS``.
+  - Scope/risk: kernel untouched (that was PR #8); public signature unchanged; no other callers. Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o SUM_ROWS``.
   - Reading note: same launch-geometry genre as rope (PR #7) but a different mechanism — rope's excess lanes were idle-but-resident (occupancy theft), these actively participated with zeros (sync/scheduling waste). Same smell, two diseases.
 
-- ``unary.cu`` — branch ``perf/unary-vec4``, PR #10 (open). Merging this = Bronze x2.
+- ``unary.cu`` — branch ``perf/unary-vec4``, PR #10 (merged). Merging this = Bronze x2.
   - Change: vectorized ``unary_op_kernel`` — the ONE template behind ~26 elementwise ops (relu/gelu/silu/exp/...) plus fused relu_sqr — with the ``alignas`` vec4 idiom (16B f32 / 8B f16 accesses, in-kernel scalar tail, alignment-dispatched, scalar fallback kept). Highest leverage-per-line of the vectorization PRs: one kernel, 26+ ops.
   - Also fixed two launch-math slips found while reading: silu_back's ceil-divide mixed two different block-size constants (benign only because both are 256 today — a retuning landmine), and xielu's ``(k + BS)/BS`` launched one empty extra block whenever k divides evenly.
-  - Scope/risk: bitwise identical (per-element math untouched); no ``__restrict__`` (in-place ops); PDL preserved. Gated/GLU kernels left scalar — their per-row offset indexing needs a row-alignment argument, future PR. Unvalidated: ``test-backend-ops -o UNARY / SILU_BACK / XIELU``.
+  - Scope/risk: bitwise identical (per-element math untouched); no ``__restrict__`` (in-place ops); PDL preserved. Gated/GLU kernels left scalar — their per-row offset indexing needs a row-alignment argument, future PR. Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o UNARY / SILU_BACK / XIELU``.
   - Reading note: launch-config arithmetic is copy-pasted boilerplate nobody reads — which is exactly why two of the file's three hand-written ceil-divides had slips. Boilerplate that must be repeated is boilerplate that will eventually be repeated wrong.
 
-- ``diagmask.cu`` — branch ``perf/diagmask-block-cap``, PR #11 (open).
+- ``diagmask.cu`` — branch ``perf/diagmask-block-cap``, PR #11 (merged).
   - Change: block size raised from a fixed one-warp (1, 32) to 256, capped at the row length rounded to a warp. Two-file diff (define in ``.cuh`` + launcher); kernel untouched.
   - Why faster: the per-SM resident-*block* limit (16-32 by arch) binds before the thread budget with one-warp blocks — 512-1024 resident threads of a 1536-2048 budget, a 25-50% occupancy ceiling from block-slot exhaustion on a memory-bound elementwise kernel.
-  - Scope/risk: pure elementwise, zero cross-thread interaction → bitwise identical under ANY launch shape (strongest correctness class for geometry changes). Unvalidated: ``test-backend-ops -o DIAG_MASK_INF``. Op is only hot on non-FA attention paths.
+  - Scope/risk: pure elementwise, zero cross-thread interaction → bitwise identical under ANY launch shape (strongest correctness class for geometry changes). Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o DIAG_MASK_INF``. Op is only hot on non-FA attention paths.
   - Reading note: went in expecting the rope disease (blocks too big) and found the mirror image (blocks too small). Launch geometry fails in both directions: too-big blocks waste allocation on dead lanes; too-small blocks starve the SM via the block-slot limit. Always check BOTH bounds. Also: verify the actual #define before claiming a finding — the hypothesis formed from the launcher's shape was wrong until the constant was read.
   - Badge-math correction (from this session): Pair Extraordinaire tiers 1/10/24/48 (co-authored commits in merged PRs); Pull Shark tiers 2/16/128/1024 (merged PRs authored) — the user earns BOTH per merged PR here. "16" belongs to Pull Shark, not Pair Extraordinaire. GitHub publishes no official numbers; the profile progress bar is ground truth.
 
@@ -81,20 +90,51 @@ One entry per finished kernel: what changed, why it should be faster, and what s
   - ``arange.cu`` — ``perf/arange-float4``, PR #14. Computed float4 stores (same ``start + step*i`` per lane). Minor op; done for sweep completeness.
   - Status note: the elementwise vectorization sweep is now complete across scale/clamp/unary/softcap/fill/arange. Remaining board: gated-GLU vectorization (hot SwiGLU path), rope powf→exp2f (needs hardware), getrows.cu (MoE-hot), cpy.cu (KV-cache-hot), then the matmul/flash-attention deep end.
 
-- Gated GLU kernels (``unary.cu``, second visit) — ``perf/glu-gated-vec4``, PR #15 (open).
+- Gated GLU kernels (``unary.cu``, second visit) — ``perf/glu-gated-vec4``, PR #15 (merged).
   - Change: v4 variants of ``unary_gated_op_kernel`` (reglu/geglu/swiglu/geglu_erf/geglu_quick + fused unary+mul) and ``swiglu_oai_kernel``, completing PR #10's deferred work. Reuses the ``unary_vec4`` wrapper already merged.
   - The key insight (the "row-alignment argument" PR #10 punted on): with per-row offset indexing ``j = (i/n)*o + i%n``, a 4-span is safe iff it never straddles a row — guaranteed by ``n % 4 == 0`` (span stays in one row of contiguous dst → x/g spans are consecutive), ``o0/o1 % 4 == 0`` (row bases stay aligned), plus base-pointer alignment (which also captures the swapped-gate ``+= nc`` offset case automatically). All real FFN dims qualify → vector path IS the common path.
-  - Why it matters: SwiGLU FFN is the hottest elementwise traffic in non-fused inference. Bitwise identical; PDL preserved where it existed. Unvalidated: ``test-backend-ops -o REGLU/GEGLU/SWIGLU/SWIGLU_OAI``, ``llama-bench``.
+  - Why it matters: SwiGLU FFN is the hottest elementwise traffic in non-fused inference. Bitwise identical; PDL preserved where it existed. Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o REGLU/GEGLU/SWIGLU/SWIGLU_OAI``, ``llama-bench``.
   - Reading note: "deferred as future work" in a PR is a promissory note — the deferral was because a safety argument (row spans) hadn't been made, and the follow-up PR's job was to make that argument explicitly, not just to write the code.
 
-- ``getrows.cu`` — ``perf/getrows-conv-vec``, PR #16 (open).
+- ``getrows.cu`` — ``perf/getrows-conv-vec``, PR #16 (merged).
   - Change: filled a dispatch gap upstream left — the float path's vectorized kernel (``int4`` bit-copy) only fires for same-type gathers; converting gathers (f16/bf16 embedding table → f32 dst, the standard f16-model token lookup) fell to fully scalar. Added ``k_get_rows_float_conv_vec``: 4 elems/thread, per-lane ``ggml_cuda_cast`` (identical to scalar → bitwise identical), dual-sided alignment checks (strides divisible by ``4*sizeof`` of EACH element type), reusing upstream's own ``enough_blocks`` occupancy heuristic.
   - Noted-not-fixed: ``k_get_rows_back_float`` is O(vocab x batch) per column (scans all grad rows per dst row). Real target; needs algorithmic redesign (sort/segment or atomics) with determinism tradeoffs — its own PR someday, hardware required.
   - Reading note: this file shows what "upstream already optimized it" looks like — tuned kernels, fastdiv, occupancy heuristics. The remaining wins in such files are GAPS in dispatch coverage, not naive code: read the dispatch conditions and ask which real workload falls through to the slow path.
 
-- ``cpy.cu`` — ``perf/cpy-quant-launch``, PR #17 (open). The biggest launch-geometry find of the campaign.
+- ``cpy.cu`` — ``perf/cpy-quant-launch``, PR #17 (merged). The biggest launch-geometry find of the campaign.
   - Change: all ELEVEN quantized copy launchers (f32<->q8_0/q4_0/q4_1/q5_0/q5_1, f32->iq4_nl) launched ``<<<num_blocks, 1>>>`` — one-thread CUDA blocks. With the per-SM resident-block cap (16-32), that is ~1% occupancy and 1/32 warp lanes alive. The q->f32 launchers ALSO spawned 32x too many blocks (``num_blocks = ne`` while the kernel strides by qk). Fixed host-side: full ``CUDA_CPY_BLOCK_SIZE`` (64) thread blocks; kernels already index by global thread id → bitwise identical.
   - Why it matters: this is the per-token KV-cache write for quantized cache types (``--cache-type-k q8_0`` etc.). Expected order-of-magnitude kernel speedup for large copies.
   - Future work noted in PR: warp-per-quant-block cooperation (needs ``cpy_blck`` signature changes).
-  - Scope/risk: scalar/transpose/memcpy paths untouched (they were already well-tended — tiled transpose, cudaMemcpy2DAsync fast path). Unvalidated: ``test-backend-ops -o CPY``, ``llama-bench --cache-type-k q8_0``.
+  - Scope/risk: scalar/transpose/memcpy paths untouched (they were already well-tended — tiled transpose, cudaMemcpy2DAsync fast path). Validated on FASRC A100 2026-08-16 (see "Hardware validation" below) via: ``test-backend-ops -o CPY``, ``llama-bench --cache-type-k q8_0``.
   - Reading note: the sibling scalar paths in the SAME file were carefully engineered while the quant paths kept a naive launch for years — optimization attention within one file is uneven. Never assume file-level quality is uniform; audit each launcher independently.
+
+### Hardware validation — 2026-08-16, FASRC (gpu_test partition)
+
+- ``test-backend-ops``: **12994/12994 passed, Backend CUDA0: OK** — full correctness validation of all 17 modified kernels against the CPU reference. Build: llama.cpp @ 2f56fc3 with Pangu ggml-cuda dropped in; CUDA 12.9.1 + gcc 14 modules (gcc 15 is rejected by nvcc); Rocky 8 needed a glibc-2.28 guard around ``posix_spawn_file_actions_addchdir_np`` in ``vendor/sheredom/subprocess.h`` (host-side only, unrelated to kernels).
+- Not covered by this run: the ``sum.cu`` non-CUB fallback (HIP-only code path — needs an AMD node) and the softmax online fallback unless the suite includes rows wider than smpbo (~40K cols on A100; to be confirmed).
+- Perf comparison vs. clean baseline: pending (needs second build of unmodified 2f56fc3 on the same GPU).
+
+### A/B perf results — 2026-08-16, full A100-SXM4-40GB (kempner partition; gpu_test is MIG-only)
+
+- **CPY (PR #17, the headline): confirmed.** q4_0→f32 **27.8x** (5.7 → 157 GB/s), f32→q4_0 **4.8x** (110 → 524 GB/s). Baseline dequant ran at 5.7 GB/s — the predicted ~1% occupancy pathology, measured. 157 GB/s is still only ~13% of A100 peak → the flagged warp-per-quant-block follow-up has real headroom. Perf mode has no q8_0 CPY cases at this commit; q8_0 measurable only end-to-end via ``llama-bench --cache-type-k q8_0``.
+- **ROPE (PR #7): confirmed as hedged.** 20/56 rows faster, 1.06-1.19x, zero regressions; biggest wins on head_dim-128 shapes. Memory-bound kernel already near bandwidth, so occupancy fix yields single-digit-to-teens percent, as expected.
+- **SOFT_MAX (PR #2): confirmed — attribution note.** The 1.25-1.29x rows (ne0=131072/65536 x 16 rows, no mask) ARE the online-softmax fallback path (ncols/nrows = 8192 fails the >8192 coop condition → fallback). The widest row [524288,1,1,1] goes down the untouched cooperative path (524288/1 > 8192), so its ≤5% is expected, not a null result for our change. Predicted ~1.5x from traffic math; measured 1.25-1.29x — right mechanism, usual theory-to-practice haircut.
+- **CUMSUM (PR #5): the honest miss.** Big shape [2M x 8] +36%, but 5-15% REGRESSIONS on mid-size few-row shapes (32K-131K x 4-8 rows). Hypothesis: one float4 load per thread has 4x fewer outstanding memory ops than 4 scalar loads — lower per-thread memory-level parallelism, which is exactly what latency hiding relies on when the grid is only 4-8 blocks (one block per row) and SMs are starved. Vectorization helps bandwidth-bound regimes, hurts latency-bound ones. Follow-up PR candidate: gate ``vec_ok`` on a shape heuristic (needs tuning data from A100 + H100, not just 6 rows on one GPU). **[SUPERSEDED — see round 2: these deltas were run-to-run noise. No regression exists; no gating PR is warranted.]**
+
+### A/B round 2 — 2026-08-16, same full A100 (dense CUMSUM sweep + end-to-end llama-bench)
+
+- **Round 1's CUMSUM finding was noise.** Dense 56-cell sweep (8 ncols x 7 nrows): 52/56 cells within 0.98-1.07x; the round-1 "regressions" (0.85-0.95x) and the +36% "win" both failed to reproduce (those exact cells now read 0.98-1.02x). Both builds sit on the memory roofline at large shapes (~1.1 TB/s). The modified CUMSUM is behaviorally identical to baseline on A100. **The planned gating PR is cancelled — correctly.**
+- **Methodology lesson (mine to own):** round 1's per-shape numbers were single runs; I fit a confident mechanism story (float4 reduces per-thread MLP in latency-bound regimes) to what turned out to be noise. The physics of that tradeoff is real; the evidence for it here never existed. Rule going forward: no mechanism narratives from unrepeated microbenchmarks — demand variance (repeats or stddev) before theorizing, exactly as llama-bench reports ±.
+- **llama-bench end-to-end (qwen2.5-1.5b q4_0, pp2048/tg128, 5 reps):** parity within noise on both plain and ``-ctk q8_0`` configs (e.g. plain pp 17638±607 → 18025±22). Expected: the accelerated ops (ROPE, wide SOFT_MAX, quantized CPY) are a small slice of a matmul-dominated step — Amdahl's law. Kernel-level wins are real (round 1 microbenchmarks); model-level throughput needs the matmul/FA deep end.
+- H100 repeat skipped: builds are sm_80-only SASS (no PTX) — an H100 pass needs both trees rebuilt with sm_90 in ``CMAKE_CUDA_ARCHITECTURES``.
+- Cluster continuity: ``~/llama.cpp/HANDOFF.md`` on FASRC carries full context for future cluster sessions; raw outputs in ``~/llama.cpp/bench_ab/round2/``.
+
+- ``cpy.cu`` (second visit) — ``perf/cpy-dequant-coop``, PR #18 (open, **cluster-validated 2026-08-16 — ready to merge**).
+  - Change: first device-code redesign. The five q->f32 dequant copies go from one-thread-per-quant-block to one-thread-per-float2-pair. Measured diagnosis: 157 GB/s (13% of peak) after #17 — adjacent lanes stored 128B apart, scattering every warp store across 32 cache lines. Pair mapping coalesces stores. Index decomposition (now 16x more frequent) uses in-tree 32-bit fastdiv (getrows precedent); dispatch falls back to the serial kernel above 2^32 elements.
+  - Bitwise identical (same dequantize call + args + destination per element). f32->q untouched (needs warp amax reduction — future PR).
+  - **Prediction on record: q4_0->f32 [8192,512,2,1] goes from 157 to >800 GB/s.** Written down BEFORE measurement, per round-2 methodology: predictions first, repeats with stddev, no post-hoc stories.
+  - **Round 3 result (FASRC, full A100-SXM4-40GB, 5 reps/build, baseline = Pangu main):** CPY suite all OK incl. fastdiv permuted cases. q4_0->f32 [8192,512,2,1]: 157.3±0.1 -> **694.2±0.5 GB/s (4.41x)**. Prediction was >800: **partially met** — right mechanism, magnitude overestimated; ~1.3 TB/s roofline leaves follow-up headroom. f32->q4_0 unchanged (526.6 vs 527.6), all f32/f16/bf16 rows within 1.0%. Raw: ``~/llama.cpp/bench_ab/round3/``; candidate tree ``~/llama.cpp-pr18``.
+  - Reading note: coalescing is a property of the WORK MAPPING, not the code inside the thread — no amount of in-thread optimization (wider stores, unrolling) fixes lanes that own disjoint 128B regions; only changing which thread does what can.
+- **MEAN / SUM_ROWS (PRs #8/#9): ≤5% everywhere** — geometry/dedup changes were about small-shape overhead and code health; perf-neutral on the tested shapes, no regressions.
+- **No perf coverage at this commit** for SWIGLU/REGLU/GEGLU/SCALE/CLAMP/GET_ROWS/DIAG_MASK_INF/FILL/ARANGE (correctness-validated only — perf mode's case list omits them). Timing them would need custom perf cases in test-backend-ops or end-to-end llama-bench.
+- Raw outputs: ``~/llama.cpp/bench_ab/{base,ours}-*.txt`` on FASRC.
